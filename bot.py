@@ -1,93 +1,97 @@
-import asyncio
+import os
+import json
 import random
+import asyncio
 import aiohttp
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-import os
-from dotenv import load_dotenv
-
-# Загружаем переменные из файла .env
+# Загружаем скрытые переменные окружения
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPONSOR_TAG = os.getenv("SPONSOR_TAG")
-PANEL_URL = os.getenv("PANEL_URL")
+PANEL_URL = os.getenv("PANEL_URL")        # Формат: http://12.34.56.78:2053
 PANEL_LOGIN = os.getenv("PANEL_LOGIN")
 PANEL_PASSWORD = os.getenv("PANEL_PASSWORD")
 
+# Чистим базовый IP сервера для чекера и сборщика ссылок
+SERVER_IP = PANEL_URL.split("//")[-1].split(":")[0]
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 async def get_proxies_from_panel():
-    """Автоматически подключается к 3x-ui и забирает список рабочих прокси"""
+    """Синхронизируется с API 3x-ui и собирает актуальные протоколы"""
     proxies_list = []
     login_url = f"{PANEL_URL}/login"
     api_url = f"{PANEL_URL}/panel/api/inbounds/list"
     
-    # Используем aiohttp сессию с куками для авторизации в панели
+    # ClientSession автоматически сохраняет Cookie авторизации для последующих запросов
     async with aiohttp.ClientSession() as session:
         try:
-            # 1. Логинимся в панель
-            data = {"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
-            async with session.post(login_url, data=data, timeout=5) as resp:
+            # 1. Авторизация на панели
+            credentials = {"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
+            async with session.post(login_url, data=credentials, timeout=5) as resp:
                 if resp.status != 200:
-                    print("Ошибка авторизации в панели 3x-ui")
+                    print("[Ошибка API]: Неверные данные авторизации или панель недоступна.")
                     return proxies_list
             
-            # 2. Запрашиваем список всех подключений (Inbounds)
+            # 2. Получение списка прокси
             async with session.get(api_url, timeout=5) as resp:
                 if resp.status == 200:
                     json_data = await resp.json()
                     if json_data.get("success"):
-                        # Фильтруем и собираем прокси
+                        
                         for item in json_data.get("obj", []):
-                            # Извлекаем IP сервера из URL панели
-                            server_ip = PANEL_URL.split("//")[-1].split(":")[0]
+                            protocol = item.get("protocol")
                             port = item.get("port")
                             
-                            # Если это MTProto прокси
-                            if item.get("protocol") == "mtproto":
-                                # Парсим секрет из настроек
-                                import json
+                            # Обработка нативного MTProto
+                            if protocol == "mtproto":
                                 settings = json.loads(item.get("settings", "{}"))
-                                secret = settings.get("users", [{}])[0].get("secret", "")
-                                if secret:
-                                    proxies_list.append({
-                                        "type": "mtproto",
-                                        "server": server_ip,
-                                        "port": port,
-                                        "secret": secret
-                                    })
-                                    
-                            # Если это VLESS Reality (для выдачи ссылки текстом)
-                            elif item.get("protocol") == "vless":
-                                import json
+                                users = settings.get("users", [])
+                                if users:
+                                    secret = users[0].get("secret", "")
+                                    if secret:
+                                        proxies_list.append({
+                                            "type": "mtproto",
+                                            "server": SERVER_IP,
+                                            "port": port,
+                                            "secret": secret
+                                        })
+                                        
+                            # Обработка VLESS Reality
+                            elif protocol == "vless":
+                                settings = json.loads(item.get("settings", "{}"))
                                 stream_settings = json.loads(item.get("streamSettings", "{}"))
-                                settings = json.loads(item.get("settings", "{}"))
-                                client_id = settings.get("clients", [{}])[0].get("id", "")
+                                clients = settings.get("clients", [])
                                 
-                                if stream_settings.get("security") == "reality":
+                                if clients and stream_settings.get("security") == "reality":
+                                    client_id = clients[0].get("id", "")
                                     reality_settings = stream_settings.get("realitySettings", {})
                                     sni = reality_settings.get("serverNames", [""])[0]
                                     pbk = reality_settings.get("publicKey", "")
                                     short_id = reality_settings.get("shortIds", [""])[0]
                                     
-                                    # Формируем стандартную ссылку VLESS Reality
-                                    vless_url = f"vless://{client_id}@{server_ip}:{port}?security=reality&encryption=none&pbk={pbk}&headerType=none&fp=chrome&spx=%2F&type=tcp&sni={sni}&sid={short_id}#FastProxy"
+                                    vless_url = (
+                                        f"vless://{client_id}@{SERVER_IP}:{port}?"
+                                        f"security=reality&encryption=none&pbk={pbk}&"
+                                        f"headerType=none&fp=chrome&type=tcp&sni={sni}&sid={short_id}#FastProxy"
+                                    )
                                     proxies_list.append({
                                         "type": "vless",
                                         "url": vless_url
                                     })
         except Exception as e:
-            print(f"Ошибка при работе с API панели: {e}")
+            print(f"[Критическая ошибка API панели]: {e}")
             
     return proxies_list
 
 async def check_proxy_ping(ip, port):
-    """Быстрый асинхронный чекер доступности порта сервера"""
+    """Асинхронно тестирует TCP-порт прокси на доступность перед выдачей"""
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, int(port)), timeout=1.5
@@ -100,60 +104,54 @@ async def check_proxy_ping(ip, port):
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("🔄 Связываюсь с сервером, подбираю лучший прокси...")
+    await message.answer("🔄 Подключаюсь к кластеру серверов, проверяю статус прокси...")
     
-    # Бот сам идет в панель за свежими данными
     all_proxies = await get_proxies_from_panel()
-    
     if not all_proxies:
-        await message.answer("⚠️ Сервер временно недоступен или список прокси пуст.")
+        await message.answer("⚠️ База данных прокси пуста или сервер обновляется. Попробуйте позже.")
         return
 
-    # Перемешиваем для балансировки нагрузки
     random.shuffle(all_proxies)
     
     mtproto_proxy = None
     vless_proxy = None
     
-    # Ищем первый рабочий MTProto (проверяя пинг) и первый VLESS
     for proxy in all_proxies:
         if proxy["type"] == "mtproto":
+            # Передаем атомарные строковые и числовые типы, а не списки
             if await check_proxy_ping(proxy["server"], proxy["port"]):
                 mtproto_proxy = proxy
                 break
         elif proxy["type"] == "vless":
             vless_proxy = proxy
 
-    # Если нашли рабочий MTProto с рекламой
     if mtproto_proxy:
-        # Автоматически собираем ссылку с вашим SPONSOR_TAG
         tg_proxy_url = (
             f"https://t.me?"
             f"server={mtproto_proxy['server']}&"
             f"port={mtproto_proxy['port']}&"
-            f"secret={mtproto_proxy['secret']}&"
-            f"tag={SPONSOR_TAG}"
+            f"secret={mtproto_proxy['secret']}"
         )
+        if SPONSOR_TAG:
+            tg_proxy_url += f"&tag={SPONSOR_TAG}"
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⚡️ ПОДКЛЮЧИТЬ В 1 КЛИК", url=tg_proxy_url)]
+            [InlineKeyboardButton(text="⚡️ ПОДКЛЮЧИТЬ В 1 НАЖАТИЕ", url=tg_proxy_url)]
         ])
         
         text = (
-            "🤖 **Прокси успешно получен напрямую с сервера!**\n\n"
-            "Нажмите кнопку ниже. Telegram применит настройки автоматически. Наверху появится ваш спонсорский канал."
+            "🤖 **Индивидуальный прокси подобран!**\n\n"
+            "Нажмите кнопку ниже, чтобы применить конфигурацию ко всему приложению Telegram. Дополнительное ПО не требуется."
         )
-        
-        # Дополнительно даем VLESS ссылку, если она есть (как резерв для обхода жестких блокировок)
         if vless_proxy:
-            text += f"\n\n🔗 **Резервный VLESS (для сторонних приложений типа V2rayNG/AnXray):**\n`{vless_proxy['url']}`"
+            text += f"\n\n🔗 **Резервный ключ VLESS (для сторонних клиентов):**\n`{vless_proxy['url']}`"
             
         await message.answer(text, reply_markup=kb, parse_mode="Markdown")
     else:
-        await message.answer("❌ Рабочих MTProto прокси сейчас нет, попробуйте через пару минут.")
+        await message.answer("❌ На сервере ведутся технические работы. Пожалуйста, повторите попытку через минуту.")
 
 async def main():
-    print("Бот запущен и автоматически синхронизирован с панелью 3x-ui!")
+    print(f"[Система]: Бот инициализирован. Целевой IP панели: {SERVER_IP}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
