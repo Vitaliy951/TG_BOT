@@ -108,6 +108,7 @@ async def check_proxy(host: str, port: int) -> bool:
 
 async def get_panel_cookies(session: aiohttp.ClientSession) -> Optional[Dict[str, str]]:
     """Авторизуется на панели и возвращает cookies."""
+    base_url = PANEL_URL.rstrip('/')
     login_url = urllib.parse.urljoin(PANEL_URL, "/login")
     credentials = {"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
 
@@ -131,7 +132,9 @@ async def get_panel_cookies(session: aiohttp.ClientSession) -> Optional[Dict[str
 
 async def fetch_inbounds(session: aiohttp.ClientSession, cookies: Dict[str, str]) -> Optional[List[Dict[str, Any]]]:
     """Получает список inbound'ов с панели."""
-    api_url = urllib.parse.urljoin(PANEL_URL, "/xui/API/inbounds")
+    base_url = PANEL_URL.rstrip('/')
+    """api_url = urllib.parse.urljoin(PANEL_URL, "/xui/API/inbounds")"""
+    api_url = f"{base_url}/panel/api/inbounds/list"
     try:
         resp = await fetch_with_retry(
             session, "GET", api_url,
@@ -263,7 +266,8 @@ async def cmd_getproxy(message: types.Message):
 
     # Формируем ссылку tg://proxy
     tg_link = (
-        f"tg://proxy?server={proxy['host']}"
+        f"https://t.me?"
+        f"server={proxy['host']}"
         f"&port={proxy['port']}"
         f"&secret={proxy['secret']}"
     )
