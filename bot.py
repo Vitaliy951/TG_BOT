@@ -5,14 +5,18 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# --- НАСТРОЙКИ ---
-BOT_TOKEN = "ВАШ_ТОКЕН_ОТ_BOT_FATHER"
-SPONSOR_TAG = "ТЕГ_ИЗ_MTPROXYBOT"  # Ваш Proxy Tag, полученный от @MTProxybot для спонсорского канала
+import os
+from dotenv import load_dotenv
 
-# Настройки подключения к вашей панели 3x-ui
-PANEL_URL = "http://IP_ВАШЕГО_СЕРВЕРА:2053" 
-PANEL_LOGIN = "ВАШ_ЛОГИН_ОТ_ПАНЕЛИ"
-PANEL_PASSWORD = "ВАШ_ПАРОЛЬ_ОТ_ПАНЕЛИ"
+# Загружаем переменные из файла .env
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SPONSOR_TAG = os.getenv("SPONSOR_TAG")
+PANEL_URL = os.getenv("PANEL_URL")
+PANEL_LOGIN = os.getenv("PANEL_LOGIN")
+PANEL_PASSWORD = os.getenv("PANEL_PASSWORD")
+
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
