@@ -1,175 +1,287 @@
-import os
-import json
-import random
 import asyncio
-import aiohttp
-from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import json
+import logging
+import os
+import random
+import urllib.parse
+from typing import Dict, List, Optional, Any
 
-# Загружаем переменные окружения из файла .env
+import aiohttp
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from dotenv import load_dotenv
+
+# ---------- Настройка логирования ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Загрузка переменных окружения ----------
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SPONSOR_TAG = os.getenv("SPONSOR_TAG")
-PANEL_URL = os.getenv("PANEL_URL")        # Формат: http://12.34.56.78:2053
+PANEL_URL = os.getenv("PANEL_URL")
 PANEL_LOGIN = os.getenv("PANEL_LOGIN")
 PANEL_PASSWORD = os.getenv("PANEL_PASSWORD")
+SPONSOR_TAG = os.getenv("SPONSOR_TAG", "")  # опционально
 
-# Валидация наличия критически важных переменных
-if not all([BOT_TOKEN, PANEL_URL, PANEL_LOGIN, PANEL_PASSWORD]):
-    raise ValueError("Критические переменные окружения отсутствуют в файле .env! Проверьте конфигурацию.")
+# Таймауты (можно переопределить в .env)
+PANEL_TIMEOUT = float(os.getenv("PANEL_TIMEOUT", "10"))
+PROXY_CHECK_TIMEOUT = float(os.getenv("PROXY_CHECK_TIMEOUT", "1.5"))
+RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
+RETRY_DELAY = float(os.getenv("RETRY_DELAY", "1.0"))
 
-# Безопасно извлекаем чистый IP-адрес/хост сервера для работы чекера портов
-# Удаляет протокол 'http://', порт ':2053' и возможные слеши
-SERVER_HOST = PANEL_URL.split("//")[-1].split(":")[0].replace("/", "")
+# Проверка обязательных переменных
+required_vars = {
+    "BOT_TOKEN": BOT_TOKEN,
+    "PANEL_URL": PANEL_URL,
+    "PANEL_LOGIN": PANEL_LOGIN,
+    "PANEL_PASSWORD": PANEL_PASSWORD,
+}
+missing = [name for name, value in required_vars.items() if not value]
+if missing:
+    raise ValueError(f"Missing required env vars: {', '.join(missing)}")
 
+# Извлечение хоста панели (для проверки прокси, если понадобится)
+try:
+    parsed = urllib.parse.urlparse(PANEL_URL)
+    SERVER_HOST = parsed.hostname
+except Exception as e:
+    logger.error(f"Не удалось распарсить PANEL_URL: {e}")
+    SERVER_HOST = None
+
+if not SERVER_HOST:
+    logger.warning("SERVER_HOST не определён – проверка доступности прокси может работать некорректно.")
+
+# Предупреждение о HTTP (небезопасно)
+if parsed.scheme == "http":
+    logger.warning("⚠️ Панель доступна по HTTP – пароль передаётся в открытом виде! Рекомендуется использовать HTTPS.")
+
+# ---------- Инициализация бота ----------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-async def get_proxies_from_panel():
-    """Автоматически авторизуется в 3x-ui и собирает актуальные прокси-конфигурации через API"""
-    proxies_list = []
-    login_url = f"{PANEL_URL}/login"
-    api_url = f"{PANEL_URL}/panel/api/inbounds/list"
-    
-    # Использование ClientSession критично: объект автоматически сохраняет сессионные Cookie авторизации
-    async with aiohttp.ClientSession() as session:
+# ---------- Вспомогательные функции ----------
+async def fetch_with_retry(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    *,
+    retries: int = RETRY_COUNT,
+    delay: float = RETRY_DELAY,
+    **kwargs
+) -> Optional[aiohttp.ClientResponse]:
+    """Выполняет HTTP-запрос с повторными попытками при ошибках."""
+    for attempt in range(1, retries + 1):
         try:
-            # 1. Авторизация в панели 3x-ui
-            credentials = {"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
-            async with session.post(login_url, data=credentials, timeout=5) as resp:
-                if resp.status != 200:
-                    print("[Ошибка 3x-ui API]: Не удалось авторизоваться. Проверьте логин/пароль в .env.")
-                    return proxies_list
-            
-            # 2. Получение списка входящих подключений (Inbounds)
-            async with session.get(api_url, timeout=5) as resp:
-                if resp.status == 200:
-                    json_data = await resp.json()
-                    if json_data.get("success"):
-                        
-                        for item in json_data.get("obj", []):
-                            protocol = item.get("protocol")
-                            port = item.get("port")
-                            
-                            # Парсинг нативного MTProto прокси
-                            if protocol == "mtproto":
-                                settings = json.loads(item.get("settings", "{}"))
-                                users = settings.get("users", [])
-                                if users and len(users) > 0:
-                                    # В 3x-ui users — это список. Берем секрет первого пользователя.
-                                    secret = users[0].get("secret", "")
-                                    if secret:
-                                        proxies_list.append({
-                                            "type": "mtproto",
-                                            "server": SERVER_HOST,
-                                            "port": port,
-                                            "secret": secret
-                                        })
-                                        
-                            # Парсинг VLESS Reality
-                            elif protocol == "vless":
-                                settings = json.loads(item.get("settings", "{}"))
-                                stream_settings = json.loads(item.get("streamSettings", "{}"))
-                                clients = settings.get("clients", [])
-                                
-                                if clients and len(clients) > 0 and stream_settings.get("security") == "reality":
-                                    client_id = clients[0].get("id", "")
-                                    reality_settings = stream_settings.get("realitySettings", {})
-                                    
-                                    # Извлекаем параметры маскировки Reality
-                                    sni_list = reality_settings.get("serverNames", [""])
-                                    sni = sni_list[0] if sni_list else ""
-                                    pbk = reality_settings.get("publicKey", "")
-                                    short_ids = reality_settings.get("shortIds", [""])
-                                    short_id = short_ids[0] if short_ids else ""
-                                    
-                                    # Формируем стандартный URI для VLESS Reality клиента
-                                    vless_url = (
-                                        f"vless://{client_id}@{SERVER_HOST}:{port}?"
-                                        f"security=reality&encryption=none&pbk={pbk}&"
-                                        f"headerType=none&fp=chrome&type=tcp&sni={sni}&sid={short_id}#FastProxy"
-                                    )
-                                    proxies_list.append({
-                                        "type": "vless",
-                                        "url": vless_url
-                                    })
-        except Exception as e:
-            print(f"[Критическое исключение при запросе к панели]: {e}")
-            
-    return proxies_list
+            resp = await session.request(method, url, timeout=aiohttp.ClientTimeout(total=PANEL_TIMEOUT), **kwargs)
+            # Если статус 5xx – считаем временной ошибкой и повторяем
+            if 500 <= resp.status < 600:
+                logger.warning(f"Статус {resp.status} на {url}, попытка {attempt}/{retries}")
+                if attempt == retries:
+                    return resp
+                await asyncio.sleep(delay * attempt)
+                continue
+            return resp
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(f"Ошибка запроса к {url}: {e}, попытка {attempt}/{retries}")
+            if attempt == retries:
+                raise
+            await asyncio.sleep(delay * attempt)
+    return None
 
-async def check_proxy_ping(host, port):
-    """Асинхронный чекер: проверяет доступность TCP-порта сервера перед выдачей ссылки пользователю"""
+async def check_proxy(host: str, port: int) -> bool:
+    """Проверяет доступность прокси (TCP-коннект)."""
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, int(port)), timeout=1.5
+            asyncio.open_connection(host, port),
+            timeout=PROXY_CHECK_TIMEOUT
         )
         writer.close()
         await writer.wait_closed()
         return True
-    except:
+    except Exception as e:
+        logger.debug(f"Прокси {host}:{port} недоступен: {e}")
         return False
 
-@dp.message(CommandStart())
+async def get_panel_cookies(session: aiohttp.ClientSession) -> Optional[Dict[str, str]]:
+    """Авторизуется на панели и возвращает cookies."""
+    login_url = urllib.parse.urljoin(PANEL_URL, "/login")
+    credentials = {"username": PANEL_LOGIN, "password": PANEL_PASSWORD}
+
+    try:
+        resp = await fetch_with_retry(
+            session, "POST", login_url,
+            data=credentials,
+            retries=RETRY_COUNT
+        )
+        if resp is None:
+            logger.error("Не удалось выполнить запрос к /login")
+            return None
+        if resp.status != 200:
+            logger.error(f"Ошибка авторизации: статус {resp.status}")
+            return None
+        # Возвращаем cookies как словарь
+        return {key: value.value for key, value in resp.cookies.items()}
+    except Exception as e:
+        logger.error(f"Исключение при авторизации: {e}")
+        return None
+
+async def fetch_inbounds(session: aiohttp.ClientSession, cookies: Dict[str, str]) -> Optional[List[Dict[str, Any]]]:
+    """Получает список inbound'ов с панели."""
+    api_url = urllib.parse.urljoin(PANEL_URL, "/xui/API/inbounds")
+    try:
+        resp = await fetch_with_retry(
+            session, "GET", api_url,
+            cookies=cookies,
+            retries=RETRY_COUNT
+        )
+        if resp is None or resp.status != 200:
+            logger.error(f"Не удалось получить inbounds: статус {resp.status if resp else 'нет ответа'}")
+            return None
+        data = await resp.json()
+        return data.get("obj", [])
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка парсинга JSON от панели: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Исключение при получении inbounds: {e}")
+        return None
+
+def extract_mtproto_proxy(inbound: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Извлекает данные MTProto-прокси из одного inbound'а."""
+    if inbound.get("protocol") != "mtproto":
+        return None
+    try:
+        settings = json.loads(inbound.get("settings", "{}"))
+        stream_settings = json.loads(inbound.get("streamSettings", "{}"))
+    except json.JSONDecodeError as e:
+        logger.warning(f"Ошибка парсинга JSON в inbound {inbound.get('id')}: {e}")
+        return None
+
+    # Для MTProto секрет обычно лежит в settings["secret"]
+    secret = settings.get("secret")
+    if not secret:
+        logger.debug(f"Пропущен inbound {inbound.get('id')}: нет secret")
+        return None
+
+    # Порт берём из stream_settings или из общего поля port
+    port = inbound.get("port")
+    if not port:
+        # иногда порт может быть в stream_settings
+        port = stream_settings.get("port")
+    if not port:
+        logger.debug(f"Пропущен inbound {inbound.get('id')}: нет port")
+        return None
+
+    # Хост – обычно берётся из адреса панели, но в настройках может быть свой
+    # Для TG прокси хост – это IP или домен, на котором работает панель
+    host = SERVER_HOST  # используем хост панели (предполагаем, что прокси на том же сервере)
+    # Если в inbound есть поле "listen" – можно взять его, но обычно игнорируем
+    # Можно также попытаться взять из stream_settings["listen"]
+    listen = stream_settings.get("listen")
+    if listen and listen != "0.0.0.0":
+        host = listen
+
+    return {
+        "host": host,
+        "port": int(port),
+        "secret": secret,
+        "protocol": "mtproto",
+    }
+
+async def get_working_proxies() -> List[Dict[str, Any]]:
+    """Получает список рабочих MTProto-прокси (проверяет доступность)."""
+    async with aiohttp.ClientSession() as session:
+        cookies = await get_panel_cookies(session)
+        if not cookies:
+            logger.error("Не удалось авторизоваться на панели")
+            return []
+
+        inbounds = await fetch_inbounds(session, cookies)
+        if not inbounds:
+            logger.error("Не удалось получить список inbound'ов")
+            return []
+
+        proxies = []
+        for inbound in inbounds:
+            proxy_info = extract_mtproto_proxy(inbound)
+            if proxy_info:
+                proxies.append(proxy_info)
+
+        if not proxies:
+            logger.warning("Не найдено ни одного MTProto-прокси")
+            return []
+
+        # Проверяем доступность параллельно
+        logger.info(f"Начинаем проверку {len(proxies)} прокси...")
+        check_tasks = [check_proxy(p["host"], p["port"]) for p in proxies]
+        results = await asyncio.gather(*check_tasks)
+
+        working = [p for p, ok in zip(proxies, results) if ok]
+        logger.info(f"Найдено {len(working)} рабочих прокси из {len(proxies)}")
+        return working
+
+# ---------- Обработчики команд ----------
+@dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("🔄 Подключаюсь к панели управления серверами, проверяю статус прокси...")
-    
-    # Бот на лету запрашивает актуальные прокси из панели
-    all_proxies = await get_proxies_from_panel()
-    if not all_proxies:
-        await message.answer("⚠️ База данных прокси временно недоступна или пуста. Администратор уже уведомлен.")
+    await message.answer(
+        "👋 Привет! Я бот для выдачи прокси Telegram.\n"
+        "Используй /getproxy – я дам тебе рабочий MTProto-прокси."
+    )
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "📖 Доступные команды:\n"
+        "/getproxy – получить рабочий прокси (MTProto)\n"
+        "/start – приветствие\n"
+        "/help – эта справка"
+    )
+
+@dp.message(Command("getproxy"))
+async def cmd_getproxy(message: types.Message):
+    # Показываем статус
+    status_msg = await message.answer("⏳ Ищу рабочий прокси...")
+
+    try:
+        proxies = await get_working_proxies()
+    except Exception as e:
+        logger.error(f"Ошибка при получении прокси: {e}")
+        await status_msg.edit_text("❌ Не удалось получить список прокси из-за внутренней ошибки.")
         return
 
-    # Перемешиваем список, чтобы распределять нагрузку на разные порты/прокси
-    random.shuffle(all_proxies)
-    
-    mtproto_proxy = None
-    vless_proxy = None
-    
-    # Ищем первый рабочий MTProto и первый доступный VLESS
-    for proxy in all_proxies:
-        if proxy["type"] == "mtproto":
-            if await check_proxy_ping(proxy["server"], proxy["port"]):
-                mtproto_proxy = proxy
-                break
-        elif proxy["type"] == "vless":
-            vless_proxy = proxy
+    if not proxies:
+        await status_msg.edit_text("❌ В данный момент нет доступных рабочих прокси. Попробуйте позже.")
+        return
 
-    # Если найден активный MTProto с поддержкой спонсорского канала
-    if mtproto_proxy:
-        tg_proxy_url = (
-            f"https://t.me?"
-            f"server={mtproto_proxy['server']}&"
-            f"port={mtproto_proxy['port']}&"
-            f"secret={mtproto_proxy['secret']}"
-        )
-        # Если в .env указан рекламный тег канала, добавляем его в ссылку
-        if SPONSOR_TAG:
-            tg_proxy_url += f"&tag={SPONSOR_TAG}"
-        
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⚡️ ПОДКЛЮЧИТЬ ПРОКСИ В 1 КЛИК", url=tg_proxy_url)]
-        ])
-        
-        text = (
-            "🤖 **Индивидуальный MTProto прокси успешно подобран!**\n\n"
-            "Нажмите кнопку ниже, чтобы применить конфигурацию ко всему вашему приложению Telegram.\n\n"
-            "Дополнительное ПО не требуется. Наверху списка чатов появится закрепленный спонсорский канал."
-        )
-        
-        if vless_proxy:
-            text += f"\n\n🔗 **Резервный ключ VLESS Reality (для сторонних приложений v2ray/Xray):**\n`{vless_proxy['url']}`"
-            
-        await message.answer(text, reply_markup=kb, parse_mode="Markdown")
-    else:
-        await message.answer("❌ Свободные MTProto прокси сейчас перегружены. Пожалуйста, повторите попытку через минуту.")
+    # Перемешиваем и берём первый
+    random.shuffle(proxies)
+    proxy = proxies[0]
 
-async def main():
-    print(f"[Запуск]: Бот успешно стартовал. Целевой хост синхронизации: {SERVER_HOST}")
-    await dp.start_polling(bot)
+    # Формируем ссылку tg://proxy
+    tg_link = (
+        f"tg://proxy?server={proxy['host']}"
+        f"&port={proxy['port']}"
+        f"&secret={proxy['secret']}"
+    )
+    if SPONSOR_TAG:
+        tg_link += f"&tag={SPONSOR_TAG}"
 
+    # Отвечаем пользователю
+    await status_msg.edit_text(
+        f"✅ Ваш прокси готов:\n"
+        f"`{tg_link}`\n\n"
+        f"🔒 Протокол: MTProto\n"
+        f"🌐 Хост: {proxy['host']}\n"
+        f"🔢 Порт: {proxy['port']}\n"
+        f"🔑 Секрет: {proxy['secret'][:10]}... (скопируйте ссылку целиком)",
+        parse_mode="Markdown"
+    )
+
+# ---------- Запуск ----------
 if __name__ == "__main__":
-    asyncio.run(main())
+    logger.info("Бот запускается...")
+    dp.run_polling(bot)
